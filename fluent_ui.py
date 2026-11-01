@@ -38,8 +38,11 @@ class FluentModernGUI(MSFluentWindow):
     """Modern Fluent workbench for the existing UnipusAI automation workflow."""
 
     def __init__(self, driver, solver, bot, app_globals: Dict):
+        # 高 DPI 必须在 QApplication 创建前设置（4K 屏 200% 缩放）
+        from dpi_helper import enable_high_dpi
+        enable_high_dpi()
         self._qt_app = QApplication.instance() or QApplication(sys.argv)
-        setTheme(Theme.DARK)
+        setTheme(Theme.LIGHT)
         super().__init__()
 
         self.driver = driver
@@ -65,7 +68,7 @@ class FluentModernGUI(MSFluentWindow):
         self._selected_tab_keys = set()
         self._auto_running = False
         self._quick_running = False
-        self.is_dark = True
+        self.is_dark = False
         self._labels = []
         self._panel_cards = []
         self._metric_boxes = []
@@ -81,7 +84,21 @@ class FluentModernGUI(MSFluentWindow):
 
     def _init_window(self):
         self.setWindowTitle("")
-        self.resize(1330, 860)
+        # 窗口尺寸按屏幕可用区域比例自适应：4K/2K/1080p 下都不会过大或过小。
+        # 高 DPI 开启后 Qt 的几何值已经是逻辑像素，这里直接算比例即可。
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        if avail is not None and avail.width() > 0:
+            width = max(1080, int(avail.width() * 0.72))
+            height = max(680, int(avail.height() * 0.78))
+            self.resize(width, height)
+            # 居中显示，避免开在屏幕边缘之外
+            self.move(
+                avail.x() + (avail.width() - width) // 2,
+                avail.y() + (avail.height() - height) // 2,
+            )
+        else:
+            self.resize(1330, 860)
         self.setMinimumSize(1080, 680)
         self.setMicaEffectEnabled(False)
         self.setSystemTitleBarButtonVisible(False)

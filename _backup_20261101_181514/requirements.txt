@@ -1,0 +1,15 @@
+selenium>=4.10.0
+openai>=1.10.0
+PyQt5>=5.15.0
+PyQt-Fluent-Widgets>=1.0.0
+# 录音题（Exercise 2 主观题）TTS 主后端；没装会回退到 Windows 自带 System.Speech
+edge-tts>=7.0.0
+
+# ---- 语音识别（faster-whisper，GPU 专用）--------------------------------
+# 需要 NVIDIA 显卡；没有 CUDA 时会直接报错，不回退 CPU。
+# 依赖说明：
+#   ctranslate2        推理后端
+#   av==19.*           faster-whisper 的音频解码依赖（Python 3.15 需 abi3 wheel）
+#   nvidia-cublas-cu12 / nvidia-cudnn-cu12   CUDA 运行库（cublas64_12.dll / cudnn64_9.dll）
+#   注意：av 新版本移除了 metadata_errors 参数，实际解码走系统 ffmpeg，见 AudioRecognizer.py
+faster-whisper>=1.2.0
