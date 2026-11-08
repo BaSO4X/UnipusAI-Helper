@@ -1963,6 +1963,116 @@ return Array.from((arguments[0] || document).querySelectorAll('.record-button-wr
   });
 """
 
+RECORD_BLANK_VALUES_JS = r"""
+return Array.from((arguments[0] || document).querySelectorAll('input, textarea'))
+  .filter(function (el) {
+    const t = (el.getAttribute('type') || 'text').toLowerCase();
+    if (['checkbox', 'radio', 'hidden', 'file', 'submit'].indexOf(t) >= 0) { return false; }
+    return true;
+  })
+  .map(function (el) { return (el.value || '').trim(); });
+"""
+
+# 「填空 + 朗读」题（如《理解当代中国》Oral practice / Activity 2）：
+# 页面没有示范原声，只有录音 + 回放按钮；题干是一句英文，中间挖空，空已经被解析
+# 阶段填好（readonly 框）。这类题要读的是「题目原句本身」——把行内文本节点和输入框
+# 的值按 DOM 顺序拼起来，就是标准答案句，直接交给 TTS，一句一条，互不复用。
+RECORD_ROW_SENTENCE_JS = r"""
+return (function (root, idx) {
+  const blank = { sentence: '', raw: '', inputs: 0, missing: 0 };
+  if (!root) { return blank; }
+  // 行容器：新版 course-v2 里 .oral-study-sentence-scoop 是嵌套的，外层带分数、
+  // 内层才是题干；只取「直接管着一个录音按钮」的最内层 scoop，避免取到外层整块。
+  const ROW_SEL = '.oral-study-sentence-scoop, .oral-study-sentence';
+  let rows = Array.from(root.querySelectorAll(ROW_SEL))
+    .filter(function (el) {
+      if (!el.querySelector('.record-icon.button-record')) { return false; }
+      const inner = el.querySelectorAll(ROW_SEL);
+      for (let i = 0; i < inner.length; i++) {
+        if (inner[i].querySelector('.record-icon.button-record')) { return false; }
+      }
+      return true;
+    });
+  if (!rows.length) {
+    // 只有单个按钮的块（Exercise 2 这类主观题）
+    rows = Array.from(root.querySelectorAll('.p-oral-personal-state, .record-button-group, .record-button-wrap'))
+      .filter(function (el) { return el.querySelectorAll('.record-icon.button-record').length === 1; });
+  }
+  const row = rows[idx] || (rows.length ? null : root);
+  if (!row) { return blank; }
+  const answers = (arguments[2] && arguments[2].length) ? arguments[2] : null;
+  const walk = (node, parts, state) => {
+    if (node.nodeType === 3) {
+      const t = (node.nodeValue || '').replace(/[\u00a0]/g, ' ');
+      if (t.trim()) { parts.push(t); }
+      return;
+    }
+    if (node.nodeType !== 1) { return; }
+    const tag = node.tagName.toLowerCase();
+    if (['script', 'style', 'audio', 'video', 'svg', 'button'].indexOf(tag) >= 0) { return; }
+    if (node.classList && (node.classList.contains('record-button-wrap') ||
+                           node.classList.contains('record-button-group') ||
+                           node.classList.contains('ucomp-recorder') ||
+                           // 分数（准确度/流利度/完整度）不是题目内容
+                           node.classList.contains('score_layout') ||
+                           node.classList.contains('score-color-0'))) {
+      return;
+    }
+    // 空位组件：只取它里面 input 的 value，跳过 placeholder（同一份答案）
+    if (node.classList && node.classList.contains('comp-abs-input')) {
+      const box = node.querySelector('input, textarea');
+      const order = state.inputs;
+      state.inputs += 1;
+      let v = box ? (box.value || '').trim() : '';
+      // 空框（readonly 靠评分回填、还没分）用调用方传进来的答案按顺序补上
+      if (!v && answers && order < answers.length) { v = String(answers[order] || '').trim(); }
+      if (v) {
+        parts.push(' ' + v + ' ');
+      } else {
+        // 没答案：留一个带序号的占位符，绝不能让后面的句子被吞掉
+        state.missing += 1;
+        parts.push(' __BLANK' + order + '__ ');
+      }
+      return;
+    }
+    if (tag === 'input' || tag === 'textarea') {
+      state.inputs += 1;
+      const v = (node.value || '').trim();
+      if (v) { parts.push(' ' + v + ' '); } else { state.missing += 1; }
+      return;
+    }
+    const kids = node.childNodes || [];
+    const block = ['div', 'p', 'li', 'tr', 'br'].indexOf(tag) >= 0;
+    if (block && parts.length) { parts.push(' '); }
+    for (let i = 0; i < kids.length; i++) { walk(kids[i], parts, state); }
+    if (block) { parts.push(' '); }
+  };
+  const parts = [];
+  const state = { inputs: 0, missing: 0 };
+  walk(row, parts, state);
+  let text = parts.join('');
+  if (!text.trim() && row !== root) {
+    const p2 = [];
+    const s2 = { inputs: 0, missing: 0 };
+    walk(root, p2, s2);
+    text = p2.join('');
+    state.inputs = s2.inputs; state.missing = s2.missing;
+  }
+  text = text.replace(/\s+/g, ' ').trim();
+  // 去掉分数尾巴（"准确度：3流利度：49完整度：4"）和句首题号
+  text = text.replace(/准确度.*$/, '').trim();
+  text = text.replace(/^[\s(（]?\d{1,2}\s*[.、)）:：]\s*/, '');
+  text = text.replace(/[（(][^）)]*[\u4e00-\u9fa5][^）)]*[）)]/g, ' ');
+  text = text.replace(/\s+/g, ' ').trim();
+  // 修掉填空插入后的标点空格："modernization , and" -> "modernization, and"
+  text = text.replace(/\s+([,.;:!?])/g, '$1').replace(/\(\s+/g, '(').replace(/\s+\)/g, ')');
+  text = text.replace(/\s+([,.;:!?])(\s|$)/g, '$1$2');
+  text = text.replace(/\s+(["”])/g, '$1');
+  text = text.replace(/\.([A-Z])/g, '. $1');
+  return { sentence: text, raw: (row.innerText || '').trim(), inputs: state.inputs, missing: state.missing };
+})(arguments[0], arguments[1], arguments[2]);
+"""
+
 RECORD_ROW_STATE_JS = r"""
 return (function (root, idx, selectors) {
   const blank = { text: '', score: null, stop: false, wave: '', recorded: false,
@@ -1992,7 +2102,7 @@ return (function (root, idx, selectors) {
   }
   const node = row.querySelector('.score_layout') || scope.querySelector('.score_layout');
   const text = node ? ((node.innerText || node.textContent || '').trim()) : '';
-  const match = text.match(/(\d{1,3})/);
+  const nums = (text.match(/\d{1,3}/g) || []).map(function (n) { return parseInt(n, 10); });
   const icon = row.querySelector(sel);
   // 录音中图标会换成实心方块，空闲时 svg 里只有一个 opacity=0 的 rect
   const stop = !!(icon && icon.querySelector('svg rect[fill="currentColor"]'));
@@ -2010,7 +2120,8 @@ return (function (root, idx, selectors) {
   const uploaded = audios.length - blob;
   return {
     text: text,
-    score: match ? parseInt(match[1], 10) : null,
+    // 跟读题给的是「准确度/流利度/完整度」三个分数，取三数平均当总分
+    score: nums.length ? Math.round(nums.reduce(function (a, b) { return a + b; }, 0) / nums.length) : null,
     stop: stop,
     wave: waveNode ? waveNode.className : '',
     recorded: (blob + uploaded) > 0,
@@ -3950,6 +4061,8 @@ class AnswerExecutor:
     def __init__(self, driver, tts: Optional["TTSEngine"] = None):
         self.driver = driver
         self.tts = tts
+        # 录音题「填空 + 朗读」用：刚写进/抓下来的填空答案，按 q 记一份
+        self.record_blanks: Dict[int, List[str]] = {}
 
     def execute(self, question: Question, answer: str) -> bool:
         executors = {
@@ -3970,6 +4083,9 @@ class AnswerExecutor:
         }
 
         executor = executors.get(question.q_type, self._fill_unknown)
+        if question.q_type == QuestionType.RECORD:
+            return self._answer_record(question, answer,
+                                       self.record_blanks.get(id(question.element), []))
         return executor(question, answer)
 
     def _fill_single_choice(self, q: Question, answer: str) -> bool:
@@ -4355,9 +4471,10 @@ class AnswerExecutor:
     RECORD_RETRY_PAD = 1.3
     RECORD_MIN_SCORE = 60
     RECORD_MAX_SECONDS = 105.0  # 限时自由作答（页面写的 02:00）留一点余量
+    RECORD_AFTER_STOP_SECONDS = 1.0  # 停止录音后只等这么久让上传发声，不再轮询评分
     RECORD_AUDIO_CACHE: Dict[str, bytes] = {}
 
-    def _answer_record(self, q: Question, answer: str = "") -> bool:
+    def _answer_record(self, q: Question, answer: str = "", blanks: Optional[List[str]] = None) -> bool:
         """完成录音题：有原声就借原声，没原声就把 answer 合成成语音再喂进麦克风。"""
         items = list(q.record_items or [])
         if not items:
@@ -4370,33 +4487,47 @@ class AnswerExecutor:
             print(f"\t录音注入初始化失败: {probe}")
             return False
 
+        # 没有原声的条目分两种：
+        #   1) 「填空 + 朗读」题——题干是英文句、空已经填好，直接拼原句来读（首选，
+        #      逐条各读各的，准确度/完整度最高，也不用花 token 让模型写稿）；
+        #   2) 真·主观题——只有题干没有原句，才用模型写的口语稿。
+        sentences = self._record_sentences(q, blanks)
         texts = self._record_speech_texts(q, answer)
         if q.needs_speech_script:
-            if any(texts):
+            if any(sentences):
+                used = sum(1 for i, item in enumerate(items)
+                           if not (item.get('url') or '').strip() and sentences[i])
+                mode = "拼题目原句" if not any(texts) else "拼题目原句（口语稿仅作兜底）"
+                print(f"\t录音题没有原声，{mode}逐条朗读（{used} 条）")
+                for i in range(min(len(items), len(sentences))):
+                    if sentences[i]:
+                        # 打全句，不截断：截断的日志会让人误以为 TTS 只读了一半
+                        print(f"\t  第 {i + 1} 条（{len(sentences[i].split())} 词）: {sentences[i]}")
+            elif any(texts):
                 print(f"\t录音题没有原声，用 TTS 朗读模型稿件（约 {len(' '.join(texts).split())} 词）")
             else:
                 print("\t录音题没有原声，也没有拿到口语稿，跳过")
 
+        # 「拼原句」优先：有句子就用句子，没句子才用模型写的口语稿
+        for idx in range(len(items)):
+            if sentences and idx < len(sentences) and sentences[idx]:
+                if not texts:
+                    texts = [''] * len(items)
+                texts[idx] = sentences[idx]
+
+        # 每条录完即算完成：不再回页面查分数、也不补录。评分是平台服务端的异步任务，
+        # 查它只会让流程空等几十秒，还容易把已经录好的条目再覆盖一遍。
+        recorded = 0
         for idx in range(len(items)):
             try:
-                self._record_one_item(q, idx, texts)
+                if self._record_one_item(q, idx, texts):
+                    recorded += 1
             except Exception as exc:
                 print(f"\t第 {idx + 1} 条录音失败: {str(exc)[:80]}")
                 logger.error("录音题执行失败", exc_info=True)
 
-        # 收尾：平台提交时会检查「有没有作答」，漏掉的条目补录一次
-        missing = [i for i in range(len(items)) if not self._row_done(q, i)]
-        if missing:
-            print(f"\t有 {len(missing)} 条没有录制结果，补录: {[i + 1 for i in missing]}")
-            for idx in missing:
-                try:
-                    self._record_one_item(q, idx, texts)
-                except Exception:
-                    logger.error("录音题补录失败", exc_info=True)
-
-        done = sum(1 for i in range(len(items)) if self._row_done(q, i))
-        print(f"\t录音题完成 {done}/{len(items)} 条")
-        return done > 0
+        print(f"\t录音题完成 {recorded}/{len(items)} 条（已停止判分轮询）")
+        return recorded > 0
 
     def _row_state(self, q: Question, idx: int) -> Optional[dict]:
         try:
@@ -4425,6 +4556,109 @@ class AnswerExecutor:
 
     def _row_done(self, q: Question, idx: int) -> bool:
         return self._row_recorded(self._row_state(q, idx) or {})
+
+    def record_blank_sentences(self, q: Question) -> List[str]:
+        """「填空 + 朗读」题：把已填进页面的空答案先抓下来存盘。
+
+        很多页面的输入框是 readonly，靠平台评分回填，模型匹配阶段写的答案可能根本没
+        落进 DOM。这里先记一份，拼句时用它补空缺，保证读的是「带答案的完整句」。
+        """
+        try:
+            info = self.driver.execute_script(RECORD_BLANK_VALUES_JS, q.element)
+        except Exception:
+            return []
+        out = []
+        for raw in (info or []):
+            value = re.sub(r'\s+', ' ', str(raw or '')).strip()
+            if value:
+                out.append(value)
+        if out:
+            self.record_blanks[id(q.element)] = out
+        return out
+
+    def _cached_blanks(self, q: Question) -> List[str]:
+        return self.record_blanks.get(id(q.element), []) or []
+
+    def _record_sentences(self, q: Question, answers: Optional[List[str]] = None) -> List[str]:
+        """逐条取「题目原句」：行内文本 + 已填好的输入框值，按 DOM 顺序拼起来。
+
+        这是「填空 + 朗读」题的正确读法：读的就是题目给的那一句，不需要模型写稿，
+        也不需要页面提供示范音频。页面上的空是 readonly、靠评分回填的，所以把模型
+        给的答案（answers）也传进去：DOM 里空着就按顺序补，保证句子完整。
+        """
+        items = q.record_items or []
+        count = len(items)
+        if count <= 0:
+            return []
+        out = ['' for _ in range(count)]
+        fallback = [str(a or '').strip() for a in (answers or [])]
+        cursor = 0  # 模型答案按页面上空框的先后顺序排队
+        for idx in range(count):
+            if (items[idx].get('url') or '').strip():
+                continue  # 有原声的跟读题不用拼句
+            info = None
+            try:
+                info = self.driver.execute_script(RECORD_ROW_SENTENCE_JS, q.element, idx)
+            except Exception:
+                info = None
+            info = info or {}
+            n_inputs = max(0, int(info.get('inputs') or 0))
+            row_answers = fallback[cursor:cursor + n_inputs]
+            cursor += n_inputs
+            # DOM 里空框有值时 JS 已经拼好；空着的用答案补一遍再拼
+            text = self._clean_sentence(info.get('sentence') or '')
+            if row_answers:
+                filled = self._filled_sentence(q, idx, row_answers)
+                if filled:
+                    text = filled
+            # 占位符没收到的空：用缓存里同序号的答案补，补不到就明说，绝不读半句
+            text = self._resolve_blank_markers(text, row_answers or self._cached_blanks(q))
+            if text:
+                out[idx] = text
+        return out
+
+    @staticmethod
+    def _resolve_blank_markers(text: str, answers: List[str]) -> str:
+        """把 __BLANKn__ 换成同序号的答案；换不到就把占位符去掉并记一笔。"""
+        if not text:
+            return ''
+        value = text
+        for match in list(re.finditer(r'__BLANK(\d+)__', text)):
+            n = int(match.group(1))
+            answer = ''
+            if answers and n < len(answers):
+                answer = str(answers[n] or '').strip()
+            value = value.replace(match.group(0), answer, 1)
+        missing = value.count('__BLANK')
+        value = re.sub(r'\s+', ' ', value).strip()
+        value = re.sub(r'\s+([,.;:!?])', r'\1', value)
+        if missing:
+            print(f"\t\t警告：有 {missing} 个空没拿到答案，该句可能不完整")
+        return value
+
+    def _filled_sentence(self, q: Question, idx: int, answers: List[str]) -> str:
+        """把空着的空框按答案补上后重新拼句（不写页面，只用于朗读）。"""
+        try:
+            info = self.driver.execute_script(RECORD_ROW_SENTENCE_JS, q.element, idx, answers)
+        except Exception:
+            return ''
+        return self._clean_sentence((info or {}).get('sentence') or '')
+
+    @staticmethod
+    def _clean_sentence(text: str) -> str:
+        value = (text or '').strip()
+        if not value:
+            return ''
+        value = re.sub(r'^[\s(（]?\d{1,2}\s*[.、)）:：]\s*', '', value)
+        value = re.sub(r'[（(][^）)]*[\u4e00-\u9fa5][^）)]*[）)]', ' ', value)
+        value = re.sub(r'\s+', ' ', value).strip()
+        # 至少要像一句英文，且不能过长（超过 120 词说明抓到的是整段课文）
+        words = value.split()
+        if len(words) < 3 or len(words) > 120:
+            return ''
+        if CJK_CHAR_PATTERN.search(value):
+            return ''
+        return value
 
     def _record_speech_texts(self, q: Question, answer: str) -> List[str]:
         """把模型给的稿件按条目切好；有原声的条目用不到这些文本。"""
@@ -4525,23 +4759,18 @@ class AnswerExecutor:
                 print(f"\t第 {idx + 1} 条: 点击停止失败")
                 return False
 
-            # 停止后平台要上传音频再评分，长录音要多等一会儿
-            timeout = max(30.0, min(120.0, clip * 1.2))
-            last_state = self._wait_record_finish(q, idx, timeout=timeout, baseline=baseline)
-            score = (last_state or {}).get('score')
-            if score is None:
-                if last_state and self._row_recorded(last_state, baseline):
-                    print(f"\t第 {idx + 1} 条: 已录制（{clip:.1f}s，未返回分数）")
-                    return True
-                print(f"\t第 {idx + 1} 条: 未拿到录制结果（可能录音未被识别）")
-            else:
+            # 停止录音之后不再轮询等评分：平台通常一秒内就出分，等它反而空耗几十秒，
+            # 而且分数高低不影响「这一条已经答过」的判断。这里只留一个很短的固定
+            # 停顿，让页面把录音上传任务发出去，然后直接认为这一条完成。
+            time.sleep(self.RECORD_AFTER_STOP_SECONDS)
+            state = self._row_state(q, idx) or {}
+            score = state.get('score')
+            if score is not None:
                 print(f"\t第 {idx + 1} 条: 得分 {score}")
-                if int(score) >= self.RECORD_MIN_SCORE:
-                    return True
-            time.sleep(0.6)
-            if last_state is None:
-                break
-        return bool(last_state) and self._row_recorded(last_state, baseline)
+            else:
+                print(f"\t第 {idx + 1} 条: 已录完（{clip:.1f}s），不再等评分")
+            return True
+        return False
 
     def _wait_record_score(self, q: Question, idx: int, timeout: float = 20.0) -> Optional[int]:
         """轮询页面，等第 idx 条录音的分数出现（只看这条自己那一行）。"""
@@ -8674,9 +8903,16 @@ class AISolver:
                         if not self._tts().enabled:
                             print("    录音题没有原声，TTS 已关闭，跳过该题")
                             continue
-                        script = self._speaking_script_for(q, directions)
-                        if not script:
-                            continue
+                        # 「填空 + 朗读」题的空在这一步之前已经填进页面 → 先把拼原句
+                        # 要用的文本抓下来；页面没填过空时（模型没给答案）再问一次模型，
+                        # 只填进拼句缓存，不再用它当演讲稿。
+                        blanks = self.executor.record_blank_sentences(q)
+                        if any(blanks):
+                            print("    录音题按题目原句朗读（填空答案已就位）")
+                        else:
+                            script = self._speaking_script_for(q, directions)
+                            if not script:
+                                continue
                     if self.executor.execute(q, script):
                         record_answered += 1
                 print(f"    录音题完成 {record_answered}/{len(record_questions)}")
