@@ -201,10 +201,9 @@ class Config:
     model: str
     temperature: float
     max_tokens: int
-    # 录音题（Exercise 2 这类没有原声的自由作答）用 TTS 合成语音
-    tts_engine: str = "auto"  # auto / edge / sapi / off
-    tts_voice: str = ""       # 留空按引擎给默认英语音色
-    tts_proxy: str = ""       # edge-tts 走代理时填，如 http://127.0.0.1:7890
+    tts_engine: str = "auto"
+    tts_voice: str = ""
+    tts_proxy: str = ""
     screenshot: bool = False
     browser: str = DEFAULT_BROWSER
     record_score_threshold: float = 70
@@ -227,8 +226,6 @@ class Config:
     hold_listening_pad_max: float = 20.0
     hold_listening_fallback: float = 120.0  # 听力题取不到音频时长时的兜底
     audio_probe_timeout: float = 15.0       # ffprobe 探测超时
-    # 界面默认主题：dark / light / system（system = 跟随系统深浅色）
-    default_theme: str = "dark"
 
     @property
     def ai_configured(self) -> bool:
@@ -274,15 +271,6 @@ class Config:
         if hold_pad_max < hold_pad_min:
             hold_pad_min, hold_pad_max = hold_pad_max, hold_pad_min
 
-        def _theme(raw) -> str:
-            """界面默认主题容错：只认 dark/light/system，其余回落到 dark。"""
-            value = str(raw or "").strip().lower()
-            if value in ("light", "白", "浅色", "bright", "day"):
-                return "light"
-            if value in ("system", "auto", "跟随系统"):
-                return "system"
-            return "dark"
-
         return cls(
             url=data.get("url") or DEFAULT_LOGIN_URL,
             username=(data.get("username") or "").strip(),
@@ -317,7 +305,6 @@ class Config:
             hold_listening_pad_max=hold_pad_max,
             hold_listening_fallback=_hold_num("hold_listening_fallback", 120.0),
             audio_probe_timeout=_hold_num("audio_probe_timeout", 15.0),
-            default_theme=_theme(data.get("default_theme")),
         )
 
 
@@ -10903,11 +10890,7 @@ class AISolver:
                 except Exception as e:
                     err_summary = _format_webdriver_error(e, self.driver)
                     print(f"    切换Unit失败: {err_summary}")
-                    # 完整打印：type + 完整 message（换成单行），并写进日志文件
-                    detail = ' '.join(str(e).split())
-                    print(f"    切换Unit失败 [{type(e).__name__}]: {detail[:400]}")
-                    logger.warning(f"切换Unit失败 ({tab.get('display') or tab_name}) "
-                                   f"[{type(e).__name__}]: {detail}")
+                    logger.warning(f"切换Unit失败 ({tab.get('display') or tab_name}): {err_summary}")
                     return 'skipped'
 
             chapter_clicked = False
@@ -12568,8 +12551,6 @@ class AISolver:
 
             if self._should_stop():
                 return False
-            # 注意：分批作答时 normal_questions 会被清空，是否提交要看 total_questions，
-            # 否则「做完不交卷」，用户还得手动点提交。
             if total_questions:
                 if not self._hold_before_submit(questions, f'第 {page_num} 页'):
                     return False
@@ -13246,8 +13227,6 @@ class AISolver:
         if not self._hold_before_submit(questions, f'题目组 {group_type}'):
             return False
 
-        # 提交前退出内容层：切单元后「本单元学习规则」弹窗可能再次出现，
-        # 它会挡住提交按钮（它在外壳层，只有真实鼠标点击才有效）。
         PublishPlayer.reset(self.driver)
         popup_closed = self.publish_executor.dismiss_rules_popup()
         if popup_closed:
@@ -14981,8 +14960,6 @@ class PopupWatcher:
 
 if __name__ == '__main__':
     print('*' * 25 + "Unipus-Helper" + '*' * 25)
-
-    # 高 DPI 由 Qt6（PySide6）自行处理，Qt 迁移时已移除 dpi_helper
 
     # 先把临时目录换成可写的：受限环境下 Edge 启动会因为系统 TEMP 不可写而失败
     ensure_writable_temp_dir()

@@ -25,6 +25,5 @@
   "hold_listening_pad_min": 10,
   "hold_listening_pad_max": 20,
   "hold_listening_fallback": 120,
-  "audio_probe_timeout": 15,
-  "default_theme": "dark"
+  "audio_probe_timeout": 15
 }
