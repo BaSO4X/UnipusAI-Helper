@@ -5773,8 +5773,6 @@ class AnswerExecutor:
                    and not CJK_CHAR_PATTERN.search(line)]
         return ' '.join(english)[:600]
 
-
-
     def _record_speech_texts(self, q: Question, answer: str) -> List[str]:
         count = len(q.record_items or [])
         if count <= 0:
@@ -7764,7 +7762,6 @@ class PublishAnswerExecutor(AnswerExecutor):
 
     def __init__(self, driver, tts=None, stop_requested=None):
         super().__init__(driver, tts=tts, stop_requested=stop_requested)
-        self.stop_requested = stop_requested or threading.Event()
 
     def _fill_single_choice(self, q: Question, answer: str) -> bool:
         if q.options and q.element.find_elements(By.CSS_SELECTOR, '[data-ipublish-question-type="evaluation"]'):
@@ -10744,8 +10741,7 @@ class AISolver:
                     else:
                         unit_index = tab['_unit_idx']
                     if unit_index < 0 or unit_index >= len(unit_tabs):
-                        print(f"    目标Unit索引越界（请求 {unit_index}，"
-                              f"实际 {len(unit_tabs)} 个），跳过")
+                        print("    目标Unit不存在，跳过")
                         return 'skipped'
                     if self._should_stop():
                         return 'stopped'
@@ -12380,10 +12376,10 @@ class AISolver:
             if self._should_stop():
                 return False
             if self_check_handled and not normal_questions:
-                if not self._hold_before_submit(questions, '自评页'):
-                    return False
                 _dismiss_known_info_overlays(self.driver)
                 _install_submit_network_hook(self.driver)
+                if not self._hold_before_submit(questions, '自评页'):
+                    return False
                 if not self.executor.submit() or not self._wait_for_submit_complete():
                     return False
                 if self._should_stop():
@@ -12415,10 +12411,10 @@ class AISolver:
             if self._should_stop():
                 return False
             if total_questions:
-                if not self._hold_before_submit(questions, f'第 {page_num} 页'):
-                    return False
                 _dismiss_known_info_overlays(self.driver)
                 _install_submit_network_hook(self.driver)
+                if not self._hold_before_submit(questions, f'第 {page_num} 页'):
+                    return False
             if total_questions and self.executor.submit():
                 if not self._wait_for_submit_complete():
                     self._last_tab_outcome = 'error'
