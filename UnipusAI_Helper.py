@@ -4952,16 +4952,10 @@ class AnswerExecutor:
     ANSWER_LABEL_PATTERN = r'(?:My voice文字作答|简答题|选词/选择填空|填空题|答案|选词填空|翻译|Answer)'
     NUMBER_PREFIX_PATTERN = r'(?:空\s*)?\d+\s*[.、:：\)\]]|Blank\s*\d+\s*[.、:：\)\]]'
 
-    def __init__(self, driver, tts: Optional["TTSEngine"] = None, ai_client=None,
-                 prompt_builder=None, stop_requested: Optional[threading.Event] = None):
+    def __init__(self, driver, tts: Optional["TTSEngine"] = None, stop_requested=None):
         self.driver = driver
         self.tts = tts
-        # 朗读稿还原要用模型：把题干里的中文提示翻成英文，只翻不扩写
-        self.ai_client = ai_client
-        self.prompt_builder = prompt_builder
         self.stop_requested = stop_requested if stop_requested is not None else threading.Event()
-        # 题号 → 已还原的完整英文句子，避免同一题重复请求模型
-        self._transcript_cache: Dict[int, str] = {}
 
     def execute(self, question: Question, answer: str) -> bool:
         executors = {
@@ -5434,27 +5428,7 @@ class AnswerExecutor:
             return False
 
         texts = self._record_speech_texts(q, answer)
-        if q.needs_speech_script:
-            # 题干本身就是朗读稿：整段发给模型，只把括号里的中文提示翻成英文，不扩写。
-            # 还原成功后覆盖模型写的口语稿；还原不了才继续用口语稿兜底。
-            transcript = self._transcript_for(q, len(items), q.directions or "")
-            restored = [t for t in transcript if t.strip()]
-            if restored:
-                merged = []
-                for idx in range(len(items)):
-                    page_text = (items[idx].get('text') or '').strip()
-                    source = page_text or transcript[idx] or ""
-                    merged.append(source or (texts[idx] if idx < len(texts) else ""))
-                texts = merged
-                print("\t录音题按题干原句朗读（中文提示已换成英文，不做扩写）")
-                for i, value in enumerate(texts):
-                    if value:
-                        print(f"\t  第 {i + 1} 条: {value}")
-            elif any(texts):
-                print(f"\t录音题没有原声，用 TTS 朗读模型稿件（约 {len(' '.join(texts).split())} 词）")
-            else:
-                print("\t录音题没有原声，也没有拿到口语稿，跳过")
-        elif not any((item.get('url') or '').strip() for item in items):
+        if not any((item.get('url') or '').strip() for item in items):
             print("\t录音题没有原声，用 TTS 朗读页面原文")
 
         for idx in range(len(items)):
@@ -5799,111 +5773,7 @@ class AnswerExecutor:
                    and not CJK_CHAR_PATTERN.search(line)]
         return ' '.join(english)[:600]
 
-    # ---- 朗读稿还原：把题干里的中文提示翻成英文，整句发回模型 ----------
 
-    TRANSCRIPT_LINE_PATTERN = re.compile(r'^\s*\(?\d{1,2}\)?\s*[.、)）:：]?\s*')
-
-    def _transcript_for(self, q: Question, count: int, directions: str = "") -> List[str]:
-        """拿这道题要朗读的完整英文句子（每行一条）。
-
-        不做 DOM 拼句：题干本身就是答案句，直接整段发给模型，让它只把
-        括号里的中文翻成英文。模型不可用时退回题干原文（去中文提示）。
-        """
-        cache_key = id(q.element)
-        cached = self._transcript_cache.get(cache_key)
-        if cached:
-            return self._split_transcript(cached, count)
-
-        source = (q.text or "").strip()
-        if not source:
-            return [""] * count
-
-        # 全是纯英文、没有中文提示：题干本身就是朗读稿，不用问模型
-        if not CJK_CHAR_PATTERN.search(source):
-            cleaned = self._clean_transcript_text(source)
-            if cleaned:
-                self._transcript_cache[cache_key] = cleaned
-                return self._split_transcript(cleaned, count)
-
-        reply = self._ask_transcript(q, count, directions)
-        text = self._clean_transcript_text(reply) if reply else ""
-        if text and CJK_CHAR_PATTERN.search(text):
-            # 模型把中文留下来了：这份稿子不能直接读，按失败处理
-            print("    朗读稿还原：模型输出仍含中文，退回题干原文")
-            text = ""
-        if not text:
-            # 模型没给或给了中文：退回题干，只把中文括号抹掉
-            text = self._clean_transcript_text(source, strip_cjk_hints=True)
-        if text:
-            self._transcript_cache[cache_key] = text
-        return self._split_transcript(text, count) if text else [""] * count
-
-    def _ask_transcript(self, q: Question, count: int, directions: str) -> str:
-        """把整段题干发给模型，要求逐行输出完整英文句子。"""
-        if self.ai_client is None or self.prompt_builder is None:
-            return ""
-        if self.stop_requested.is_set():
-            return ""
-        try:
-            prompt = self.prompt_builder.build_record_transcript(q, count, directions)
-        except Exception as exc:
-            logger.debug("构建朗读稿提示词失败: %s", exc)
-            return ""
-        try:
-            reply = self.ai_client.ask(prompt, retry_count=2,
-                                       stop_requested=self.stop_requested)
-        except Exception as exc:
-            print(f"    朗读稿还原请求失败: {str(exc)[:80]}")
-            return ""
-        if not reply:
-            print("    朗读稿还原：模型没有返回内容，退回题干原文")
-        return reply or ""
-
-    def _split_transcript(self, text: str, count: int) -> List[str]:
-        """按行/按编号切成 count 条；不够就复用最后一条，多了截断。"""
-        if not text:
-            return [""] * count
-        lines = [self.TRANSCRIPT_LINE_PATTERN.sub("", line).strip()
-                 for line in str(text).splitlines()]
-        lines = [line for line in lines if line]
-        if not lines:
-            return [""] * count
-        if len(lines) == count:
-            return lines
-        if len(lines) == 1:
-            return lines * count
-        if len(lines) < count:
-            return lines + [lines[-1]] * (count - len(lines))
-        return lines[:count]
-
-    @staticmethod
-    def _clean_transcript_text(text: str, strip_cjk_hints: bool = False) -> str:
-        """逐行清掉编号、markdown、引号与残留中文；保留换行，句子骨架不动。"""
-        value = (text or "").strip()
-        if not value:
-            return ""
-        value = re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', value).strip()
-        value = re.sub(r'^(朗读稿|参考答案|Answer|Script|Transcript)\s*[:：]\s*', '',
-                       value, flags=re.I)
-        lines = []
-        for raw in value.splitlines():
-            line = AnswerExecutor.TRANSCRIPT_LINE_PATTERN.sub("", raw).strip()
-            if not line:
-                continue
-            line = re.sub(r'[*_`#>]+', ' ', line)
-            line = re.sub(r'\s+([,.;:!?])', r'\1', line)
-            line = re.sub(r'\s+', ' ', line).strip()
-            if not line:
-                continue
-            if strip_cjk_hints:
-                # 只删括号里的中文提示，句子骨架一个字不动
-                line = re.sub(r'[（(]\s*[^（）()]*[\u4e00-\u9fa5][^（）()]*\s*[）)]', ' ', line)
-                line = CJK_CHAR_PATTERN.sub(' ', line)
-                line = re.sub(r'\s+([,.;:!?])', r'\1', line)
-                line = re.sub(r'\s+', ' ', line).strip()
-            if line:
-                lines.append(line)
-        return "\n".join(lines)
 
     def _record_speech_texts(self, q: Question, answer: str) -> List[str]:
         count = len(q.record_items or [])
@@ -7892,11 +7762,8 @@ class PublishAnswerExecutor(AnswerExecutor):
     RULE_POPUP_TEXTS = ('我知道了', '知道了', '确定')
     last_rejection = ''
 
-    def __init__(self, driver, tts=None, stop_requested=None, ai_client=None,
-                 prompt_builder=None):
-        super().__init__(driver, tts=tts, ai_client=ai_client,
-                         prompt_builder=prompt_builder,
-                         stop_requested=stop_requested)
+    def __init__(self, driver, tts=None, stop_requested=None):
+        super().__init__(driver, tts=tts, stop_requested=stop_requested)
         self.stop_requested = stop_requested or threading.Event()
 
     def _fill_single_choice(self, q: Question, answer: str) -> bool:
@@ -10269,14 +10136,10 @@ class AISolver:
         )
         self.prompt_builder = PromptBuilder(self.ai_client, vocab_store=self.vocab_store)
         self.executor = AnswerExecutor(driver, tts=self.tts_engine,
-                                       ai_client=self.ai_client,
-                                       prompt_builder=self.prompt_builder,
                                        stop_requested=self.stop_requested)
         self.publish_parser = PublishQuestionParser(driver)
         self.publish_executor = PublishAnswerExecutor(driver, tts=self.tts_engine,
-                                                      stop_requested=self.stop_requested,
-                                                      ai_client=self.ai_client,
-                                                      prompt_builder=self.prompt_builder)
+                                                      stop_requested=self.stop_requested)
         self.video_handler = VideoHandler(driver, self.config, self.stop_requested)
         self.content_handlers: List[ContentHandler] = [
             AudioHandler(driver, self.stop_requested),
@@ -14961,7 +14824,6 @@ class PopupWatcher:
 if __name__ == '__main__':
     print('*' * 25 + "Unipus-Helper" + '*' * 25)
 
-    # 先把临时目录换成可写的：受限环境下 Edge 启动会因为系统 TEMP 不可写而失败
     ensure_writable_temp_dir()
 
     skip_check = '--skip-check' in sys.argv
