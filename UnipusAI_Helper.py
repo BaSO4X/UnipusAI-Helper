@@ -201,9 +201,10 @@ class Config:
     model: str
     temperature: float
     max_tokens: int
-    tts_engine: str = "auto"
-    tts_voice: str = ""
-    tts_proxy: str = ""
+    # 录音题（Exercise 2 这类没有原声的自由作答）用 TTS 合成语音
+    tts_engine: str = "auto"  # auto / edge / sapi / off
+    tts_voice: str = ""       # 留空按引擎给默认英语音色
+    tts_proxy: str = ""       # edge-tts 走代理时填，如 http://127.0.0.1:7890
     screenshot: bool = False
     browser: str = DEFAULT_BROWSER
     record_score_threshold: float = 70
@@ -226,6 +227,8 @@ class Config:
     hold_listening_pad_max: float = 20.0
     hold_listening_fallback: float = 120.0  # 听力题取不到音频时长时的兜底
     audio_probe_timeout: float = 15.0       # ffprobe 探测超时
+    # 界面默认主题：dark / light / system（system = 跟随系统深浅色）
+    default_theme: str = "dark"
 
     @property
     def ai_configured(self) -> bool:
@@ -271,6 +274,15 @@ class Config:
         if hold_pad_max < hold_pad_min:
             hold_pad_min, hold_pad_max = hold_pad_max, hold_pad_min
 
+        def _theme(raw) -> str:
+            """界面默认主题容错：只认 dark/light/system，其余回落到 dark。"""
+            value = str(raw or "").strip().lower()
+            if value in ("light", "白", "浅色", "bright", "day"):
+                return "light"
+            if value in ("system", "auto", "跟随系统"):
+                return "system"
+            return "dark"
+
         return cls(
             url=data.get("url") or DEFAULT_LOGIN_URL,
             username=(data.get("username") or "").strip(),
@@ -305,6 +317,7 @@ class Config:
             hold_listening_pad_max=hold_pad_max,
             hold_listening_fallback=_hold_num("hold_listening_fallback", 120.0),
             audio_probe_timeout=_hold_num("audio_probe_timeout", 15.0),
+            default_theme=_theme(data.get("default_theme")),
         )
 
 
@@ -4233,6 +4246,16 @@ class GenericReplyStrategy(QuestionParserStrategy):
                 lines.append(f"【题目要求】{directions}")
             if material:
                 lines.append(f"【原文/材料】{material}")
+            prompts = self._collect_sub_prompts(container, textareas)
+            distinct = {prompt.strip() for prompt in prompts if prompt and prompt.strip()}
+            if len(distinct) > 1:
+                lines.append(f"【小题列表】（本页共 {len(textareas)} 个小题）")
+                for stem_index, prompt in enumerate(prompts, 1):
+                    stem = re.sub(r'^\d+\s*[.、)]\s*', '', (prompt or '').strip()).strip()
+                    lines.append(f"{stem_index}. {stem if stem else '（本小题无独立题干，按材料与题目要求作答）'}")
+                lines.append("【要求】上面每个小题都必须单独作答；回答时严格按 1、2、… 编号逐题输出，格式：1.第一题答案 2.第二题答案 …")
+            elif len(textareas) > 1:
+                lines.append(f"【作答方式】本页共 {len(textareas)} 个输入框：请按输入框顺序用 1、2、… 编号逐个作答，每个输入框都必须有内容。")
             if re.search(r'translat|翻译', directions or '', re.I):
                 lines.append("请把上面的原文完整翻译成中文，只输出译文。")
             elif re.search(r'summari|总结|概括|main idea|general idea', directions or '', re.I):
@@ -4289,6 +4312,42 @@ class GenericReplyStrategy(QuestionParserStrategy):
                 container.find_elements(By.CSS_SELECTOR, '.fe-scoop input'))
         except Exception:
             return []
+
+    @staticmethod
+    def _collect_sub_prompts(container, textareas) -> List[str]:
+        """尽量收集每个 textarea 对应的小题题干（输入框头或占位符）。"""
+        prompts = [''] * len(textareas)
+        try:
+            boxes = container.find_elements(By.CSS_SELECTOR, '.question-inputbox')
+        except Exception:
+            boxes = []
+        if boxes and len(boxes) == len(textareas):
+            for index, box in enumerate(boxes):
+                text = ''
+                try:
+                    header = box.find_element(By.CSS_SELECTOR, '.question-inputbox-header')
+                    text = (header.text or '').strip()
+                except Exception:
+                    text = ''
+                if not text:
+                    try:
+                        text = (box.text or '').strip()
+                    except Exception:
+                        text = ''
+                prompts[index] = text
+        if not any(prompt.strip() for prompt in prompts):
+            for index, area in enumerate(textareas):
+                prompt = ''
+                for attr in ('placeholder', 'aria-label', 'title'):
+                    try:
+                        value = area.get_attribute(attr)
+                    except Exception:
+                        value = None
+                    if value and value.strip():
+                        prompt = value.strip()
+                        break
+                prompts[index] = prompt
+        return prompts
 
     @staticmethod
     def _material_text(container, textarea) -> str:
@@ -4734,6 +4793,23 @@ class PromptBuilder:
             elif re.search(r'translat|翻译', combined_dir, re.I):
                 target_lang = 'zh' if not CJK_CHAR_PATTERN.search(q_text) else 'generic'
 
+        if len(q.inputs) > 1:
+            stems = []
+            for item in (q.banked_blanks or []):
+                stem = ''
+                if isinstance(item, dict):
+                    stem = str(item.get('words') or item.get('question_text') or '').strip()
+                if stem:
+                    stems.append(stem)
+            if len(stems) == len(q.inputs) and len(set(stems)) > 1:
+                lines.append(f"   【小题列表】（共 {len(stems)} 个小题，每题都必须作答）")
+                for stem_index, stem in enumerate(stems, 1):
+                    lines.append(f"   {stem_index}. {stem}")
+                lines.append("   （回答时严格按 1、2、… 编号逐题输出，按题号对应每个小题，不要合并、不要遗漏）")
+            elif not stems:
+                lines.append(f"   （本题为 {len(q.inputs)} 个小题的简答组：请按题号 1、2、… 分别作答，每个小题都要有单独内容）")
+            lines.append(f"   （共 {len(q.inputs)} 小题）")
+
         multi_item = multi_text or len(q.inputs) > 1
         if target_lang == 'en':
             suffix = "请按题号分别编号输出" if multi_item else "不要保留中文原文或题号"
@@ -4827,7 +4903,8 @@ class PromptBuilder:
             lines.append("判断题: 每题回答 T 或 F，如：1.T 2.F")
 
         if QuestionType.TEXT in type_counts:
-            lines.append("简答题: 1.答案内容...")
+            lines.append("简答题: 逐题编号作答，如：1.第一题答案 2.第二题答案")
+            lines.append("注意：每个小题都必须作答，逐题编号，不要合并成一段，也不要遗漏任何一个题号！")
 
         if QuestionType.MY_VOICE_TEXT in type_counts:
             lines.append("My voice文字作答: 1.英文介绍内容（500字符以内）")
@@ -4888,10 +4965,16 @@ class AnswerExecutor:
     ANSWER_LABEL_PATTERN = r'(?:My voice文字作答|简答题|选词/选择填空|填空题|答案|选词填空|翻译|Answer)'
     NUMBER_PREFIX_PATTERN = r'(?:空\s*)?\d+\s*[.、:：\)\]]|Blank\s*\d+\s*[.、:：\)\]]'
 
-    def __init__(self, driver, tts: Optional["TTSEngine"] = None, stop_requested=None):
+    def __init__(self, driver, tts: Optional["TTSEngine"] = None, ai_client=None,
+                 prompt_builder=None, stop_requested: Optional[threading.Event] = None):
         self.driver = driver
         self.tts = tts
+        # 朗读稿还原要用模型：把题干里的中文提示翻成英文，只翻不扩写
+        self.ai_client = ai_client
+        self.prompt_builder = prompt_builder
         self.stop_requested = stop_requested if stop_requested is not None else threading.Event()
+        # 题号 → 已还原的完整英文句子，避免同一题重复请求模型
+        self._transcript_cache: Dict[int, str] = {}
 
     def execute(self, question: Question, answer: str) -> bool:
         executors = {
@@ -5364,7 +5447,27 @@ class AnswerExecutor:
             return False
 
         texts = self._record_speech_texts(q, answer)
-        if not any((item.get('url') or '').strip() for item in items):
+        if q.needs_speech_script:
+            # 题干本身就是朗读稿：整段发给模型，只把括号里的中文提示翻成英文，不扩写。
+            # 还原成功后覆盖模型写的口语稿；还原不了才继续用口语稿兜底。
+            transcript = self._transcript_for(q, len(items), q.directions or "")
+            restored = [t for t in transcript if t.strip()]
+            if restored:
+                merged = []
+                for idx in range(len(items)):
+                    page_text = (items[idx].get('text') or '').strip()
+                    source = page_text or transcript[idx] or ""
+                    merged.append(source or (texts[idx] if idx < len(texts) else ""))
+                texts = merged
+                print("\t录音题按题干原句朗读（中文提示已换成英文，不做扩写）")
+                for i, value in enumerate(texts):
+                    if value:
+                        print(f"\t  第 {i + 1} 条: {value}")
+            elif any(texts):
+                print(f"\t录音题没有原声，用 TTS 朗读模型稿件（约 {len(' '.join(texts).split())} 词）")
+            else:
+                print("\t录音题没有原声，也没有拿到口语稿，跳过")
+        elif not any((item.get('url') or '').strip() for item in items):
             print("\t录音题没有原声，用 TTS 朗读页面原文")
 
         for idx in range(len(items)):
@@ -5708,6 +5811,112 @@ class AnswerExecutor:
                    if re.search(r'[A-Za-z]{3}', line)
                    and not CJK_CHAR_PATTERN.search(line)]
         return ' '.join(english)[:600]
+
+    # ---- 朗读稿还原：把题干里的中文提示翻成英文，整句发回模型 ----------
+
+    TRANSCRIPT_LINE_PATTERN = re.compile(r'^\s*\(?\d{1,2}\)?\s*[.、)）:：]?\s*')
+
+    def _transcript_for(self, q: Question, count: int, directions: str = "") -> List[str]:
+        """拿这道题要朗读的完整英文句子（每行一条）。
+
+        不做 DOM 拼句：题干本身就是答案句，直接整段发给模型，让它只把
+        括号里的中文翻成英文。模型不可用时退回题干原文（去中文提示）。
+        """
+        cache_key = id(q.element)
+        cached = self._transcript_cache.get(cache_key)
+        if cached:
+            return self._split_transcript(cached, count)
+
+        source = (q.text or "").strip()
+        if not source:
+            return [""] * count
+
+        # 全是纯英文、没有中文提示：题干本身就是朗读稿，不用问模型
+        if not CJK_CHAR_PATTERN.search(source):
+            cleaned = self._clean_transcript_text(source)
+            if cleaned:
+                self._transcript_cache[cache_key] = cleaned
+                return self._split_transcript(cleaned, count)
+
+        reply = self._ask_transcript(q, count, directions)
+        text = self._clean_transcript_text(reply) if reply else ""
+        if text and CJK_CHAR_PATTERN.search(text):
+            # 模型把中文留下来了：这份稿子不能直接读，按失败处理
+            print("    朗读稿还原：模型输出仍含中文，退回题干原文")
+            text = ""
+        if not text:
+            # 模型没给或给了中文：退回题干，只把中文括号抹掉
+            text = self._clean_transcript_text(source, strip_cjk_hints=True)
+        if text:
+            self._transcript_cache[cache_key] = text
+        return self._split_transcript(text, count) if text else [""] * count
+
+    def _ask_transcript(self, q: Question, count: int, directions: str) -> str:
+        """把整段题干发给模型，要求逐行输出完整英文句子。"""
+        if self.ai_client is None or self.prompt_builder is None:
+            return ""
+        if self.stop_requested.is_set():
+            return ""
+        try:
+            prompt = self.prompt_builder.build_record_transcript(q, count, directions)
+        except Exception as exc:
+            logger.debug("构建朗读稿提示词失败: %s", exc)
+            return ""
+        try:
+            reply = self.ai_client.ask(prompt, retry_count=2,
+                                       stop_requested=self.stop_requested)
+        except Exception as exc:
+            print(f"    朗读稿还原请求失败: {str(exc)[:80]}")
+            return ""
+        if not reply:
+            print("    朗读稿还原：模型没有返回内容，退回题干原文")
+        return reply or ""
+
+    def _split_transcript(self, text: str, count: int) -> List[str]:
+        """按行/按编号切成 count 条；不够就复用最后一条，多了截断。"""
+        if not text:
+            return [""] * count
+        lines = [self.TRANSCRIPT_LINE_PATTERN.sub("", line).strip()
+                 for line in str(text).splitlines()]
+        lines = [line for line in lines if line]
+        if not lines:
+            return [""] * count
+        if len(lines) == count:
+            return lines
+        if len(lines) == 1:
+            return lines * count
+        if len(lines) < count:
+            return lines + [lines[-1]] * (count - len(lines))
+        return lines[:count]
+
+    @staticmethod
+    def _clean_transcript_text(text: str, strip_cjk_hints: bool = False) -> str:
+        """逐行清掉编号、markdown、引号与残留中文；保留换行，句子骨架不动。"""
+        value = (text or "").strip()
+        if not value:
+            return ""
+        value = re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', value).strip()
+        value = re.sub(r'^(朗读稿|参考答案|Answer|Script|Transcript)\s*[:：]\s*', '',
+                       value, flags=re.I)
+        lines = []
+        for raw in value.splitlines():
+            line = AnswerExecutor.TRANSCRIPT_LINE_PATTERN.sub("", raw).strip()
+            if not line:
+                continue
+            line = re.sub(r'[*_`#>]+', ' ', line)
+            line = re.sub(r'\s+([,.;:!?])', r'\1', line)
+            line = re.sub(r'\s+', ' ', line).strip()
+            if not line:
+                continue
+            if strip_cjk_hints:
+                # 只删括号里的中文提示，句子骨架一个字不动
+                line = re.sub(r'[（(]\s*[^（）()]*[\u4e00-\u9fa5][^（）()]*\s*[）)]', ' ', line)
+                line = CJK_CHAR_PATTERN.sub(' ', line)
+                line = re.sub(r'\s+([,.;:!?])', r'\1', line)
+                line = re.sub(r'\s+', ' ', line).strip()
+            if line:
+                lines.append(line)
+        return "\n".join(lines)
 
     def _record_speech_texts(self, q: Question, answer: str) -> List[str]:
         count = len(q.record_items or [])
@@ -7696,8 +7905,12 @@ class PublishAnswerExecutor(AnswerExecutor):
     RULE_POPUP_TEXTS = ('我知道了', '知道了', '确定')
     last_rejection = ''
 
-    def __init__(self, driver, tts=None, stop_requested=None):
-        super().__init__(driver, tts=tts, stop_requested=stop_requested)
+    def __init__(self, driver, tts=None, stop_requested=None, ai_client=None,
+                 prompt_builder=None):
+        super().__init__(driver, tts=tts, ai_client=ai_client,
+                         prompt_builder=prompt_builder,
+                         stop_requested=stop_requested)
+        self.stop_requested = stop_requested or threading.Event()
 
     def _fill_single_choice(self, q: Question, answer: str) -> bool:
         if q.options and q.element.find_elements(By.CSS_SELECTOR, '[data-ipublish-question-type="evaluation"]'):
@@ -10069,10 +10282,14 @@ class AISolver:
         )
         self.prompt_builder = PromptBuilder(self.ai_client, vocab_store=self.vocab_store)
         self.executor = AnswerExecutor(driver, tts=self.tts_engine,
+                                       ai_client=self.ai_client,
+                                       prompt_builder=self.prompt_builder,
                                        stop_requested=self.stop_requested)
         self.publish_parser = PublishQuestionParser(driver)
         self.publish_executor = PublishAnswerExecutor(driver, tts=self.tts_engine,
-                                                      stop_requested=self.stop_requested)
+                                                      stop_requested=self.stop_requested,
+                                                      ai_client=self.ai_client,
+                                                      prompt_builder=self.prompt_builder)
         self.video_handler = VideoHandler(driver, self.config, self.stop_requested)
         self.content_handlers: List[ContentHandler] = [
             AudioHandler(driver, self.stop_requested),
@@ -10677,7 +10894,8 @@ class AISolver:
                     else:
                         unit_index = tab['_unit_idx']
                     if unit_index < 0 or unit_index >= len(unit_tabs):
-                        print("    目标Unit不存在，跳过")
+                        print(f"    目标Unit索引越界（请求 {unit_index}，"
+                              f"实际 {len(unit_tabs)} 个），跳过")
                         return 'skipped'
                     if self._should_stop():
                         return 'stopped'
@@ -10685,7 +10903,11 @@ class AISolver:
                 except Exception as e:
                     err_summary = _format_webdriver_error(e, self.driver)
                     print(f"    切换Unit失败: {err_summary}")
-                    logger.warning(f"切换Unit失败 ({tab.get('display') or tab_name}): {err_summary}")
+                    # 完整打印：type + 完整 message（换成单行），并写进日志文件
+                    detail = ' '.join(str(e).split())
+                    print(f"    切换Unit失败 [{type(e).__name__}]: {detail[:400]}")
+                    logger.warning(f"切换Unit失败 ({tab.get('display') or tab_name}) "
+                                   f"[{type(e).__name__}]: {detail}")
                     return 'skipped'
 
             chapter_clicked = False
@@ -12312,10 +12534,10 @@ class AISolver:
             if self._should_stop():
                 return False
             if self_check_handled and not normal_questions:
-                _dismiss_known_info_overlays(self.driver)
-                _install_submit_network_hook(self.driver)
                 if not self._hold_before_submit(questions, '自评页'):
                     return False
+                _dismiss_known_info_overlays(self.driver)
+                _install_submit_network_hook(self.driver)
                 if not self.executor.submit() or not self._wait_for_submit_complete():
                     return False
                 if self._should_stop():
@@ -12346,11 +12568,13 @@ class AISolver:
 
             if self._should_stop():
                 return False
+            # 注意：分批作答时 normal_questions 会被清空，是否提交要看 total_questions，
+            # 否则「做完不交卷」，用户还得手动点提交。
             if total_questions:
-                _dismiss_known_info_overlays(self.driver)
-                _install_submit_network_hook(self.driver)
                 if not self._hold_before_submit(questions, f'第 {page_num} 页'):
                     return False
+                _dismiss_known_info_overlays(self.driver)
+                _install_submit_network_hook(self.driver)
             if total_questions and self.executor.submit():
                 if not self._wait_for_submit_complete():
                     self._last_tab_outcome = 'error'
@@ -13022,6 +13246,8 @@ class AISolver:
         if not self._hold_before_submit(questions, f'题目组 {group_type}'):
             return False
 
+        # 提交前退出内容层：切单元后「本单元学习规则」弹窗可能再次出现，
+        # 它会挡住提交按钮（它在外壳层，只有真实鼠标点击才有效）。
         PublishPlayer.reset(self.driver)
         popup_closed = self.publish_executor.dismiss_rules_popup()
         if popup_closed:
@@ -14756,6 +14982,9 @@ class PopupWatcher:
 if __name__ == '__main__':
     print('*' * 25 + "Unipus-Helper" + '*' * 25)
 
+    # 高 DPI 由 Qt6（PySide6）自行处理，Qt 迁移时已移除 dpi_helper
+
+    # 先把临时目录换成可写的：受限环境下 Edge 启动会因为系统 TEMP 不可写而失败
     ensure_writable_temp_dir()
 
     skip_check = '--skip-check' in sys.argv
