@@ -84,7 +84,14 @@ ApplicationWindow {
                                 { key: "tts_engine", label: "录音题 TTS 引擎", hint: "auto / edge / sapi / off" },
                                 { key: "tts_voice", label: "TTS 音色", hint: "留空使用默认英语音色" },
                                 { key: "tts_proxy", label: "TTS 代理", hint: "可选，例如 http://127.0.0.1:7890" },
-                                { key: "browser", label: "浏览器", hint: "edge（默认）/ chrome" }
+                                { key: "browser", label: "浏览器", hint: "edge（默认）/ chrome" },
+                                { key: "hold_enabled", label: "提交前停留", hint: "true / false，默认 true" },
+                                { key: "hold_normal_seconds", label: "普通题停留（秒）", hint: "默认 90，即 1 分半" },
+                                { key: "hold_normal_jitter", label: "普通题抖动（秒）", hint: "默认 30，即 ±30 秒" },
+                                { key: "hold_listening_pad_min", label: "听力额外停留最小值（秒）", hint: "默认 10，音频时长之外再加" },
+                                { key: "hold_listening_pad_max", label: "听力额外停留最大值（秒）", hint: "默认 20" },
+                                { key: "hold_listening_fallback", label: "听力兜底停留（秒）", hint: "默认 120，取不到音频时长时使用" },
+                                { key: "audio_probe_timeout", label: "ffprobe 超时（秒）", hint: "默认 15" }
                             ]
                             delegate: RowLayout {
                                 required property var modelData
