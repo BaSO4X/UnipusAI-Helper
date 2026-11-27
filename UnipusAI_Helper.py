@@ -201,9 +201,10 @@ class Config:
     model: str
     temperature: float
     max_tokens: int
-    tts_engine: str = "auto"
-    tts_voice: str = ""
-    tts_proxy: str = ""
+    # 录音题（Exercise 2 这类没有原声的自由作答）用 TTS 合成语音
+    tts_engine: str = "auto"  # auto / edge / sapi / off
+    tts_voice: str = ""       # 留空按引擎给默认英语音色
+    tts_proxy: str = ""       # edge-tts 走代理时填，如 http://127.0.0.1:7890
     screenshot: bool = False
     browser: str = DEFAULT_BROWSER
     record_score_threshold: float = 70
@@ -218,6 +219,16 @@ class Config:
     answer_api_secret: str = ""
     answer_api_host: str = ""
     answer_api_timeout: float = 30.0
+    # 提交前停留（模拟真人答题耗时）
+    hold_enabled: bool = True
+    hold_normal_seconds: float = 90.0       # 非听力题基线：1 分半
+    hold_normal_jitter: float = 30.0        # 非听力题抖动：±30 秒
+    hold_listening_pad_min: float = 10.0    # 听力题：音频时长 + 10~20 秒
+    hold_listening_pad_max: float = 20.0
+    hold_listening_fallback: float = 120.0  # 听力题取不到音频时长时的兜底
+    audio_probe_timeout: float = 15.0       # ffprobe 探测超时
+    # 界面默认主题：dark / light / system（system = 跟随系统深浅色）
+    default_theme: str = "dark"
 
     @property
     def ai_configured(self) -> bool:
@@ -247,6 +258,31 @@ class Config:
         answer_api_timeout = min(120.0, max(5.0, answer_api_timeout))
         global DEBUG_MODE
         DEBUG_MODE = data.get("debug_mode", False)
+
+        def _num(key: str, default: float) -> float:
+            """配置里的数字容错：空串/非法值回落到默认，不抛异常。"""
+            raw = data.get(key, default)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                return float(default)
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return float(default)
+
+        pad_min = _num("hold_listening_pad_min", 10.0)
+        pad_max = _num("hold_listening_pad_max", 20.0)
+        if pad_max < pad_min:
+            pad_min, pad_max = pad_max, pad_min
+
+        def _theme(raw) -> str:
+            """界面默认主题容错：只认 dark/light/system，其余回落到 dark。"""
+            value = str(raw or "").strip().lower()
+            if value in ("light", "白", "浅色", "bright", "day"):
+                return "light"
+            if value in ("system", "auto", "跟随系统"):
+                return "system"
+            return "dark"
+
         return cls(
             url=data.get("url") or DEFAULT_LOGIN_URL,
             username=(data.get("username") or "").strip(),
@@ -274,6 +310,14 @@ class Config:
             answer_api_secret=(data.get("answer_api_secret") or "").strip(),
             answer_api_host=(data.get("answer_api_host") or "").strip(),
             answer_api_timeout=answer_api_timeout,
+            hold_enabled=bool(data.get("hold_enabled", True)),
+            hold_normal_seconds=_num("hold_normal_seconds", 90.0),
+            hold_normal_jitter=_num("hold_normal_jitter", 30.0),
+            hold_listening_pad_min=pad_min,
+            hold_listening_pad_max=pad_max,
+            hold_listening_fallback=_num("hold_listening_fallback", 120.0),
+            audio_probe_timeout=_num("audio_probe_timeout", 15.0),
+            default_theme=_theme(data.get("default_theme")),
         )
 
 
@@ -4620,6 +4664,20 @@ class PromptBuilder:
     def _build_text(self, q: Question, directions: str = "", *, multi_text: bool = False) -> List[str]:
         lines = [f"{q.number}. 【简答题】{q.text}"]
         if len(q.inputs) > 1:
+            stems = []
+            for item in (q.banked_blanks or []):
+                stem = ''
+                if isinstance(item, dict):
+                    stem = str(item.get('words') or item.get('question_text') or '').strip()
+                if stem:
+                    stems.append(stem)
+            if len(stems) == len(q.inputs) and len(set(stems)) > 1:
+                lines.append(f"   【小题列表】（共 {len(stems)} 个小题，每题都必须作答）")
+                for stem_index, stem in enumerate(stems, 1):
+                    lines.append(f"   {stem_index}. {stem}")
+                lines.append("   （回答时严格按 1、2、… 编号逐题输出，按题号对应每个小题，不要合并、不要遗漏）")
+            elif not stems:
+                lines.append(f"   （本题为 {len(q.inputs)} 个小题的简答组：请按题号 1、2、… 分别作答，每个小题都要有单独内容）")
             lines.append(f"   （共 {len(q.inputs)} 小题）")
         combined_dir = f"{q.directions or ''}\n{directions or ''}"
         q_text = q.text or ''
@@ -4699,6 +4757,36 @@ class PromptBuilder:
             "1. 只输出可以直接朗读的英文正文；不要标题、不要 markdown、不要括号说明、不要中文。",
             f"2. 长度约 {words_low}-{words_high} 词，句子短、口语化，适合朗读。",
             "3. 紧扣题目要求组织内容，并结合相关材料给出具体回答。",
+        ])
+        return "\n".join(lines)
+
+    def build_record_transcript(self, q: Question, count: int,
+                                directions: str = "") -> str:
+        """把题干还原成完整英文原句：只把括号里的中文翻成英文，不扩写。
+
+        跟读/朗读类录音题的题干本身就是答案句，只是常夹着 (现代化) 这类中文提示。
+        这类题不需要模型创作内容，只需要把提示词换成英文、把句子读顺。
+        """
+        count = max(1, int(count or 1))
+        source = (q.text or "").strip()
+        lines = [
+            "【朗读稿还原】下面是某道朗读/跟读题的原始题干，句子里可能夹着括号里的中文提示。",
+            "请把题干还原成可以直接朗读的完整英文句子，原样输出。",
+            "",
+            "【原始题干】",
+            source[:1500],
+        ]
+        if directions and directions.strip() and directions.strip() not in source:
+            lines.append("")
+            lines.append("【题目指示】" + directions.strip()[:400])
+        lines.extend([
+            "",
+            "【硬性要求】",
+            "1. 只把括号里的中文翻译成对应的英文并放回原处；括号里本来就是英文就原样保留。",
+            "2. 严禁扩写、续写、润色、增删其它单词，也不要合并或拆分句子。",
+            "3. 不要留下中文、括号、题号、markdown、引号或任何解释文字。",
+            f"4. 一共有 {count} 条要朗读的内容，每条输出一行，行首写 “1)” “2)” 这样的编号。",
+            f"5. 题干里有几条就输出几条，必须正好 {count} 行，不要自己编新内容。",
         ])
         return "\n".join(lines)
 
@@ -4810,10 +4898,16 @@ class AnswerExecutor:
     ANSWER_LABEL_PATTERN = r'(?:My voice文字作答|简答题|选词/选择填空|填空题|答案|选词填空|翻译|Answer)'
     NUMBER_PREFIX_PATTERN = r'(?:空\s*)?\d+\s*[.、:：\)\]]|Blank\s*\d+\s*[.、:：\)\]]'
 
-    def __init__(self, driver, tts: Optional["TTSEngine"] = None, stop_requested=None):
+    def __init__(self, driver, tts: Optional["TTSEngine"] = None, ai_client=None,
+                 prompt_builder=None, stop_requested: Optional[threading.Event] = None):
         self.driver = driver
         self.tts = tts
+        # 朗读稿还原要用模型：把题干里的中文提示翻成英文，只翻不扩写
+        self.ai_client = ai_client
+        self.prompt_builder = prompt_builder
         self.stop_requested = stop_requested if stop_requested is not None else threading.Event()
+        # 题号 → 已还原的完整英文句子，避免同一题重复请求模型
+        self._transcript_cache: Dict[int, str] = {}
 
     def execute(self, question: Question, answer: str) -> bool:
         executors = {
@@ -5286,7 +5380,27 @@ class AnswerExecutor:
             return False
 
         texts = self._record_speech_texts(q, answer)
-        if not any((item.get('url') or '').strip() for item in items):
+        if q.needs_speech_script:
+            # 题干本身就是朗读稿：整段发给模型，只把括号里的中文提示翻成英文，不扩写。
+            # 还原成功后覆盖模型写的口语稿；还原不了才继续用口语稿兜底。
+            transcript = self._transcript_for(q, len(items), q.directions or "")
+            restored = [t for t in transcript if t.strip()]
+            if restored:
+                merged = []
+                for idx in range(len(items)):
+                    page_text = (items[idx].get('text') or '').strip()
+                    source = page_text or transcript[idx] or ""
+                    merged.append(source or (texts[idx] if idx < len(texts) else ""))
+                texts = merged
+                print("\t录音题按题干原句朗读（中文提示已换成英文，不做扩写）")
+                for i, value in enumerate(texts):
+                    if value:
+                        print(f"\t  第 {i + 1} 条: {value}")
+            elif any(texts):
+                print(f"\t录音题没有原声，用 TTS 朗读模型稿件（约 {len(' '.join(texts).split())} 词）")
+            else:
+                print("\t录音题没有原声，也没有拿到口语稿，跳过")
+        elif not any((item.get('url') or '').strip() for item in items):
             print("\t录音题没有原声，用 TTS 朗读页面原文")
 
         for idx in range(len(items)):
@@ -5630,6 +5744,112 @@ class AnswerExecutor:
                    if re.search(r'[A-Za-z]{3}', line)
                    and not CJK_CHAR_PATTERN.search(line)]
         return ' '.join(english)[:600]
+
+    # ---- 朗读稿还原：把题干里的中文提示翻成英文，整句发回模型 ----------
+
+    TRANSCRIPT_LINE_PATTERN = re.compile(r'^\s*\(?\d{1,2}\)?\s*[.、)）:：]?\s*')
+
+    def _transcript_for(self, q: Question, count: int, directions: str = "") -> List[str]:
+        """拿这道题要朗读的完整英文句子（每行一条）。
+
+        不做 DOM 拼句：题干本身就是答案句，直接整段发给模型，让它只把
+        括号里的中文翻成英文。模型不可用时退回题干原文（去中文提示）。
+        """
+        cache_key = id(q.element)
+        cached = self._transcript_cache.get(cache_key)
+        if cached:
+            return self._split_transcript(cached, count)
+
+        source = (q.text or "").strip()
+        if not source:
+            return [""] * count
+
+        # 全是纯英文、没有中文提示：题干本身就是朗读稿，不用问模型
+        if not CJK_CHAR_PATTERN.search(source):
+            cleaned = self._clean_transcript_text(source)
+            if cleaned:
+                self._transcript_cache[cache_key] = cleaned
+                return self._split_transcript(cleaned, count)
+
+        reply = self._ask_transcript(q, count, directions)
+        text = self._clean_transcript_text(reply) if reply else ""
+        if text and CJK_CHAR_PATTERN.search(text):
+            # 模型把中文留下来了：这份稿子不能直接读，按失败处理
+            print("    朗读稿还原：模型输出仍含中文，退回题干原文")
+            text = ""
+        if not text:
+            # 模型没给或给了中文：退回题干，只把中文括号抹掉
+            text = self._clean_transcript_text(source, strip_cjk_hints=True)
+        if text:
+            self._transcript_cache[cache_key] = text
+        return self._split_transcript(text, count) if text else [""] * count
+
+    def _ask_transcript(self, q: Question, count: int, directions: str) -> str:
+        """把整段题干发给模型，要求逐行输出完整英文句子。"""
+        if self.ai_client is None or self.prompt_builder is None:
+            return ""
+        if self.stop_requested.is_set():
+            return ""
+        try:
+            prompt = self.prompt_builder.build_record_transcript(q, count, directions)
+        except Exception as exc:
+            logger.debug("构建朗读稿提示词失败: %s", exc)
+            return ""
+        try:
+            reply = self.ai_client.ask(prompt, retry_count=2,
+                                       stop_requested=self.stop_requested)
+        except Exception as exc:
+            print(f"    朗读稿还原请求失败: {str(exc)[:80]}")
+            return ""
+        if not reply:
+            print("    朗读稿还原：模型没有返回内容，退回题干原文")
+        return reply or ""
+
+    def _split_transcript(self, text: str, count: int) -> List[str]:
+        """按行/按编号切成 count 条；不够就复用最后一条，多了截断。"""
+        if not text:
+            return [""] * count
+        lines = [self.TRANSCRIPT_LINE_PATTERN.sub("", line).strip()
+                 for line in str(text).splitlines()]
+        lines = [line for line in lines if line]
+        if not lines:
+            return [""] * count
+        if len(lines) == count:
+            return lines
+        if len(lines) == 1:
+            return lines * count
+        if len(lines) < count:
+            return lines + [lines[-1]] * (count - len(lines))
+        return lines[:count]
+
+    @staticmethod
+    def _clean_transcript_text(text: str, strip_cjk_hints: bool = False) -> str:
+        """逐行清掉编号、markdown、引号与残留中文；保留换行，句子骨架不动。"""
+        value = (text or "").strip()
+        if not value:
+            return ""
+        value = re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', value).strip()
+        value = re.sub(r'^(朗读稿|参考答案|Answer|Script|Transcript)\s*[:：]\s*', '',
+                       value, flags=re.I)
+        lines = []
+        for raw in value.splitlines():
+            line = AnswerExecutor.TRANSCRIPT_LINE_PATTERN.sub("", raw).strip()
+            if not line:
+                continue
+            line = re.sub(r'[*_`#>]+', ' ', line)
+            line = re.sub(r'\s+([,.;:!?])', r'\1', line)
+            line = re.sub(r'\s+', ' ', line).strip()
+            if not line:
+                continue
+            if strip_cjk_hints:
+                # 只删括号里的中文提示，句子骨架一个字不动
+                line = re.sub(r'[（(]\s*[^（）()]*[\u4e00-\u9fa5][^（）()]*\s*[）)]', ' ', line)
+                line = CJK_CHAR_PATTERN.sub(' ', line)
+                line = re.sub(r'\s+([,.;:!?])', r'\1', line)
+                line = re.sub(r'\s+', ' ', line).strip()
+            if line:
+                lines.append(line)
+        return "\n".join(lines)
 
     def _record_speech_texts(self, q: Question, answer: str) -> List[str]:
         count = len(q.record_items or [])
@@ -7588,8 +7808,12 @@ class PublishAnswerExecutor(AnswerExecutor):
     RULE_POPUP_TEXTS = ('我知道了', '知道了', '确定')
     last_rejection = ''
 
-    def __init__(self, driver, tts=None, stop_requested=None):
-        super().__init__(driver, tts=tts, stop_requested=stop_requested)
+    def __init__(self, driver, tts=None, stop_requested=None, ai_client=None,
+                 prompt_builder=None):
+        super().__init__(driver, tts=tts, ai_client=ai_client,
+                         prompt_builder=prompt_builder,
+                         stop_requested=stop_requested)
+        self.stop_requested = stop_requested or threading.Event()
 
     def _fill_single_choice(self, q: Question, answer: str) -> bool:
         if q.options and q.element.find_elements(By.CSS_SELECTOR, '[data-ipublish-question-type="evaluation"]'):
@@ -9900,10 +10124,14 @@ class AISolver:
         )
         self.prompt_builder = PromptBuilder(self.ai_client, vocab_store=self.vocab_store)
         self.executor = AnswerExecutor(driver, tts=self.tts_engine,
+                                       ai_client=self.ai_client,
+                                       prompt_builder=self.prompt_builder,
                                        stop_requested=self.stop_requested)
         self.publish_parser = PublishQuestionParser(driver)
         self.publish_executor = PublishAnswerExecutor(driver, tts=self.tts_engine,
-                                                      stop_requested=self.stop_requested)
+                                                      stop_requested=self.stop_requested,
+                                                      ai_client=self.ai_client,
+                                                      prompt_builder=self.prompt_builder)
         self.video_handler = VideoHandler(driver, self.config, self.stop_requested)
         self.content_handlers: List[ContentHandler] = [
             AudioHandler(driver, self.stop_requested),
@@ -9930,6 +10158,10 @@ class AISolver:
         )
         # 官方答案接口：命中则客观题直接用平台真值，未命中/失败一律回落 AI。
         self.answer_api = OfficialAnswerProvider(config, log=print)
+        # 音频时长缓存：url → 秒（None 表示探测过但失败，避免反复下载）
+        self._audio_duration_cache: Dict[str, Optional[float]] = {}
+        self._ffprobe_path: Optional[str] = None
+        self._ffprobe_resolved = False
 
     def _skip_record_mode(self) -> str:
         config = getattr(self, 'config', None)
@@ -9997,6 +10229,252 @@ class AISolver:
                 'unable to connect', 'connection refused', 'session deleted',
             ))
         return False
+
+    # ---- 提交前停留（模拟真人答题耗时）-----------------------------------
+    LISTENING_Q_TYPES = (
+        QuestionType.LISTENING_CHOICE,
+        QuestionType.LISTENING_FILL_IN,
+    )
+
+    # 页面方向文本里出现这些词，说明这一页带音/视频材料
+    MEDIA_DIRECTION_HINTS = (
+        'listen', 'listening', 'audio', 'hear', 'heard', 'conversation',
+        'passage', 'news', 'dictation', 'watch', 'video', 'clip', 'view',
+    )
+
+    # 从页面读全部音频元素：优先 duration，其次 currentSrc 供 ffprobe 兜底
+    PAGE_AUDIO_JS = """
+        const out = [];
+        const push = (src, dur) => {
+            const url = (src || '').split('#')[0];
+            if (!url) return;
+            const d = Number(dur);
+            out.push({src: url, duration: (isFinite(d) && d > 0) ? d : null});
+        };
+        for (const a of document.querySelectorAll('audio')) {
+            push(a.currentSrc || a.getAttribute('src')
+                 || (a.querySelector('source') && a.querySelector('source').getAttribute('src')),
+                 a.duration);
+        }
+        for (const s of document.querySelectorAll('audio source')) {
+            push(s.getAttribute('src'), null);
+        }
+        return out;
+    """
+
+    def _resolve_ffprobe(self) -> Optional[str]:
+        """定位 ffprobe：优先 PATH，其次 ffmpeg 同目录，最后常见安装路径。"""
+        if self._ffprobe_resolved:
+            return self._ffprobe_path
+        self._ffprobe_resolved = True
+
+        candidates = []
+        found = shutil.which('ffprobe')
+        if found:
+            candidates.append(found)
+        ffmpeg = shutil.which('ffmpeg')
+        if ffmpeg:
+            base = os.path.dirname(ffmpeg)
+            candidates.append(os.path.join(base, 'ffprobe.exe'))
+            candidates.append(os.path.join(base, 'ffprobe'))
+        candidates.extend([
+            r'C:\ffmpeg\bin\ffprobe.exe',
+            r'C:\Program Files\ffmpeg\bin\ffprobe.exe',
+            os.path.expandvars(r'%LOCALAPPDATA%\ffmpeg\bin\ffprobe.exe'),
+        ])
+        for path in candidates:
+            if path and os.path.exists(path):
+                self._ffprobe_path = path
+                return path
+        print("    未找到 ffprobe，听力题将退化为读取页面 <audio>.duration")
+        return None
+
+    def _probe_mp3_duration(self, url: str) -> Optional[float]:
+        """下载音频并用 ffprobe 读出精确时长（秒）。失败返回 None。"""
+        if url in self._audio_duration_cache:
+            return self._audio_duration_cache[url]
+
+        result: Optional[float] = None
+        temp_path = None
+        ffprobe = self._resolve_ffprobe()
+        if not ffprobe:
+            self._audio_duration_cache[url] = None
+            return None
+
+        try:
+            print(f"    【探测】下载音频测时长: {url.split('/')[-1][:60]}")
+            request = urllib.request.Request(url, headers={
+                'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                               'AppleWebKit/537.36 (KHTML, like Gecko) '
+                               'Chrome/120.0 Safari/537.36'),
+                'Referer': 'https://ucontent.unipus.cn/',
+            })
+            suffix = '.mp3'
+            for ext in ('.m4a', '.wav', '.aac', '.ogg'):
+                if ext in url.lower():
+                    suffix = ext
+                    break
+            with urllib.request.urlopen(request, timeout=30) as response, \
+                    tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+                handle.write(response.read())
+                temp_path = handle.name
+
+            completed = subprocess.run(
+                [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=nw=1:nk=1', temp_path],
+                capture_output=True, text=True,
+                timeout=max(5.0, float(getattr(self.config, 'audio_probe_timeout', 15.0))),
+            )
+            raw = (completed.stdout or '').strip().splitlines()
+            if raw:
+                value = float(raw[0])
+                if value > 0:
+                    result = value
+        except Exception as exc:
+            print(f"    ffprobe 探测失败: {str(exc)[:80]}")
+            result = None
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+        self._audio_duration_cache[url] = result
+        if result:
+            print(f"    音频时长 {result:.2f}s")
+        return result
+
+    def _page_audio_durations(self) -> List[float]:
+        """读取当前文档（含已切入的内容 iframe）里所有音频的时长。
+
+        先走页面自带的 <audio>.duration（不用下载）；拿不到再对 URL 跑 ffprobe。
+        """
+        entries: List[Dict[str, Any]] = []
+        try:
+            entries = self.driver.execute_script(self.PAGE_AUDIO_JS) or []
+        except Exception as exc:
+            print(f"    读取页面音频元素失败: {str(exc)[:60]}")
+            entries = []
+
+        durations: List[float] = []
+        pending: List[str] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            duration = item.get('duration')
+            url = (item.get('src') or '').strip()
+            if duration:
+                try:
+                    value = float(duration)
+                except (TypeError, ValueError):
+                    value = 0.0
+                if value > 0:
+                    durations.append(value)
+                    continue
+            if url and url not in pending:
+                pending.append(url)
+
+        for url in pending:
+            if self._should_stop():
+                break
+            probed = self._probe_mp3_duration(url)
+            if probed:
+                durations.append(probed)
+
+        return durations
+
+    def _collect_media_durations(self) -> List[float]:
+        """收集本页全部音/视频时长：顶层文档 + ipublish 内容 iframe。"""
+        durations = self._page_audio_durations()
+        if not durations and PublishPlayer.has_content_frame(self.driver):
+            with PublishFrameContext(self.driver) as context:
+                if context.entered:
+                    durations = self._page_audio_durations()
+        return durations
+
+    def _page_direction_text(self) -> str:
+        """当前页的方向/题干文本，用于判断是否含媒体材料。"""
+        texts = []
+        for selector in ('.layout-direction-container', '.abs-direction'):
+            try:
+                element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                value = (element.text or '').strip()
+                if value:
+                    texts.append(value)
+            except Exception:
+                continue
+        return ' '.join(texts).lower()
+
+    def _is_listening_page(self, questions: Optional[List[Question]] = None) -> bool:
+        """判断当前页（或题目组）是不是听力/视听题。
+
+        两个信号取或：题目类型已经是 LISTENING_*，或方向文本里出现媒体关键词。
+        """
+        for q in questions or []:
+            if getattr(q, 'q_type', None) in self.LISTENING_Q_TYPES:
+                return True
+        direction = self._page_direction_text()
+        if direction and any(hint in direction for hint in self.MEDIA_DIRECTION_HINTS):
+            return True
+        return False
+
+    def _listening_hold_seconds(self) -> float:
+        """听力题停留时长：取本页最长音频时长 + 随机 10~20 秒。
+
+        取不到时长时回落到 hold_listening_fallback（默认 120 秒）。
+        """
+        config = self.config
+        pad_min = float(getattr(config, 'hold_listening_pad_min', 10.0))
+        pad_max = float(getattr(config, 'hold_listening_pad_max', 20.0))
+        fallback = float(getattr(config, 'hold_listening_fallback', 120.0))
+
+        durations = self._collect_media_durations()
+        if not durations:
+            print(f"    未取到听力音频时长，按兜底 {fallback:.0f} 秒停留")
+            return fallback
+
+        longest = max(durations)
+        pad = random.uniform(pad_min, pad_max)
+        print(f"    听力音频最长 {longest:.2f}s，额外停留 {pad:.1f}s")
+        return longest + pad
+
+    def _normal_hold_seconds(self) -> float:
+        """非听力题停留时长：1 分半 ± 30 秒。"""
+        base = float(getattr(self.config, 'hold_normal_seconds', 90.0))
+        jitter = abs(float(getattr(self.config, 'hold_normal_jitter', 30.0)))
+        low, high = base - jitter, base + jitter
+        return max(5.0, random.uniform(low, high))
+
+    def _hold_before_submit(self, questions: Optional[List[Question]] = None,
+                            label: str = '本页') -> bool:
+        """提交前停留。返回 False 表示期间收到了停止请求。
+
+        用 stop_requested.wait() 而不是 time.sleep()：精度一样，但点「停止」
+        能立刻响应，不必等满整段停留时间。
+        """
+        if not getattr(self.config, 'hold_enabled', True):
+            return not self._should_stop()
+        if self._should_stop():
+            return False
+
+        if self._is_listening_page(questions):
+            seconds = self._listening_hold_seconds()
+            kind = '听力题'
+        else:
+            seconds = self._normal_hold_seconds()
+            kind = '普通题'
+
+        seconds = max(0.0, float(seconds))
+        print(f"    【停留】{label}提交前等待 {seconds:.1f} 秒（{kind}）...")
+        started = time.time()
+        stopped = self.stop_requested.wait(seconds)
+        elapsed = time.time() - started
+        if stopped:
+            print(f"    已请求停止，停留中断（{elapsed:.1f}s / {seconds:.1f}s）")
+            return False
+        print(f"    【停留】结束，实际等待 {elapsed:.1f} 秒")
+        return True
 
     def process_selected_tabs(self, selected_tabs: List[Dict], chapter_name: str = "",
                               on_task_done: Optional[Callable[[Dict], None]] = None,
@@ -10255,7 +10733,8 @@ class AISolver:
                     else:
                         unit_index = tab['_unit_idx']
                     if unit_index < 0 or unit_index >= len(unit_tabs):
-                        print("    目标Unit不存在，跳过")
+                        print(f"    目标Unit索引越界（请求 {unit_index}，"
+                              f"实际 {len(unit_tabs)} 个），跳过")
                         return 'skipped'
                     if self._should_stop():
                         return 'stopped'
@@ -10263,7 +10742,11 @@ class AISolver:
                 except Exception as e:
                     err_summary = _format_webdriver_error(e, self.driver)
                     print(f"    切换Unit失败: {err_summary}")
-                    logger.warning(f"切换Unit失败 ({tab.get('display') or tab_name}): {err_summary}")
+                    # 完整打印：type + 完整 message（换成单行），并写进日志文件
+                    detail = ' '.join(str(e).split())
+                    print(f"    切换Unit失败 [{type(e).__name__}]: {detail[:400]}")
+                    logger.warning(f"切换Unit失败 ({tab.get('display') or tab_name}) "
+                                   f"[{type(e).__name__}]: {detail}")
                     return 'skipped'
 
             chapter_clicked = False
@@ -11881,6 +12364,8 @@ class AISolver:
             if self._should_stop():
                 return False
             if self_check_handled and not normal_questions:
+                if not self._hold_before_submit(questions, '自评页'):
+                    return False
                 _dismiss_known_info_overlays(self.driver)
                 _install_submit_network_hook(self.driver)
                 if not self.executor.submit() or not self._wait_for_submit_complete():
@@ -11913,7 +12398,11 @@ class AISolver:
 
             if self._should_stop():
                 return False
+            # 注意：分批作答时 normal_questions 会被清空，是否提交要看 total_questions，
+            # 否则「做完不交卷」，用户还得手动点提交。
             if total_questions:
+                if not self._hold_before_submit(questions, f'第 {page_num} 页'):
+                    return False
                 _dismiss_known_info_overlays(self.driver)
                 _install_submit_network_hook(self.driver)
             if total_questions and self.executor.submit():
@@ -12582,6 +13071,13 @@ class AISolver:
         if self._should_stop():
             return False
 
+        # 提交前停留：模拟真人答题耗时。这里在顶层文档执行，
+        # 放在 PublishFrameContext 之外，避免停留期间内容 iframe 被重载。
+        if not self._hold_before_submit(questions, f'题目组 {group_type}'):
+            return False
+
+        # 提交前退出内容层：切单元后「本单元学习规则」弹窗可能再次出现，
+        # 它会挡住提交按钮（它在外壳层，只有真实鼠标点击才有效）。
         PublishPlayer.reset(self.driver)
         popup_closed = self.publish_executor.dismiss_rules_popup()
         if popup_closed:
@@ -14301,6 +14797,11 @@ class PopupWatcher:
 if __name__ == '__main__':
     print('*' * 25 + "Unipus-Helper" + '*' * 25)
 
+    # 必须在创建 QApplication 之前开启高 DPI，否则 4K 屏 200% 缩放下界面会特别小
+    from dpi_helper import enable_high_dpi
+    enable_high_dpi()
+
+    # 先把临时目录换成可写的：受限环境下 Edge 启动会因为系统 TEMP 不可写而失败
     ensure_writable_temp_dir()
 
     skip_check = '--skip-check' in sys.argv
